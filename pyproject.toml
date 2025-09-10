@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "transcribe"
+version = "0.1.0"
+description = ""
+authors = ["Cole Krumbholz <cole@colevscode.io>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+faster-whisper = "^1.2.0"
+pyannote-audio = "^3.1.0"
+torch = "^2.0.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
