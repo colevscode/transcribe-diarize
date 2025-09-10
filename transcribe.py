@@ -9,7 +9,6 @@ import argparse
 import tempfile
 import subprocess
 import json
-import pickle
 import time
 from pathlib import Path
 from faster_whisper import WhisperModel
@@ -24,15 +23,15 @@ def format_timestamp(seconds):
     return f"{hours}:{minutes:02d}:{secs:02d}"
 
 def transcribe_audio(audio_path: str, model_size: str = "base", num_speakers: int = None, 
-                    speaker_names: list = None, silent: bool = False):
+                    prompt: str = None, silent: bool = False):
     """
-    Audio transcription with speaker-aware prompts
+    Audio transcription with customizable prompts
     
     Args:
         audio_path: Path to the audio file  
         model_size: Whisper model size (tiny, base, small, medium, large-v2, large-v3)
-        num_speakers: Expected number of speakers (affects prompt)
-        speaker_names: List of speaker names (affects prompt)
+        num_speakers: Expected number of speakers (affects default prompt)
+        prompt: Custom prompt for Whisper transcription (overrides default)
         silent: If True, don't print progress messages
         
     Returns:
@@ -48,19 +47,18 @@ def transcribe_audio(audio_path: str, model_size: str = "base", num_speakers: in
         print(f"Loading Whisper model: {model_size}")
     whisper_model = WhisperModel(model_size, device="cpu", compute_type="int8")
     
-    # Create dynamic initial prompt based on speaker count
-    initial_prompt = "This is a phone conversation"
-    if num_speakers:
-        if num_speakers == 2:
-            initial_prompt += " between two people"
-        else:
-            initial_prompt += f" between {num_speakers} people"
-    elif speaker_names and len(speaker_names) > 0:
-        if len(speaker_names) == 2:
-            initial_prompt += " between two people"
-        else:
-            initial_prompt += f" between {len(speaker_names)} people"
-    initial_prompt += "."
+    # Use custom prompt if provided, otherwise create default prompt
+    if prompt:
+        initial_prompt = prompt
+    else:
+        # Create dynamic default prompt based on speaker count
+        initial_prompt = "This is a voice recording"
+        if num_speakers:
+            if num_speakers == 2:
+                initial_prompt += " of a conversation between two people"
+            else:
+                initial_prompt += f" of a conversation between {num_speakers} people"
+        initial_prompt += "."
     
     if not silent:
         print(f"Transcribing audio...")
@@ -96,7 +94,7 @@ def extract_audio_snippet(audio_path: str, duration: int = 15, start_time: int =
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
     
     # Create temporary file
-    temp_fd, temp_path = tempfile.mkstemp(suffix='.wav', prefix='speaker_id_')
+    temp_fd, temp_path = tempfile.mkstemp(suffix='.wav', prefix='test_snippet_')
     os.close(temp_fd)  # Close the file descriptor, we just need the path
     
     try:
@@ -131,146 +129,6 @@ def extract_audio_snippet(audio_path: str, duration: int = 15, start_time: int =
         if os.path.exists(temp_path):
             os.unlink(temp_path)
         raise
-
-def identify_speakers_interactively(audio_path: str, model_size: str = "base", duration: int = 60) -> list:
-    """
-    Extract a snippet, transcribe with speaker diarization, 
-    and ask user to identify speakers interactively
-    """
-    
-    print("🎙️  Speaker Identification Mode")
-    print("=" * 50)
-    print(f"Extracting first {duration} seconds for speaker identification...")
-    
-    # Extract snippet
-    snippet_path = None
-    try:
-        snippet_path = extract_audio_snippet(audio_path, duration=duration)
-        
-        print("Transcribing snippet with speaker diarization...")
-        
-        # Verify snippet was created successfully
-        if not snippet_path or not os.path.exists(snippet_path):
-            print("❌ Failed to extract audio snippet.")
-            return []
-        
-        # Use public API
-        transcription_segments, info = transcribe_audio(
-            snippet_path, 
-            model_size=model_size,
-            silent=False
-        )
-        
-        # Do speaker diarization
-        try:
-            # Read HF token
-            hf_token = None
-            try:
-                with open('.hf', 'r') as f:
-                    hf_token = f.read().strip()
-            except FileNotFoundError:
-                print("Warning: .hf file not found.")
-            
-            diarization_pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1", 
-                use_auth_token=hf_token
-            )
-            
-            diarization = diarization_pipeline(snippet_path)
-            
-            # Create speaker timeline
-            speaker_timeline = []
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                speaker_timeline.append({
-                    'start': turn.start,
-                    'end': turn.end, 
-                    'speaker': speaker
-                })
-            
-            # Get unique speakers
-            unique_speakers = sorted(list(set([s['speaker'] for s in speaker_timeline])))
-            
-            print(f"\n🔍 Found {len(unique_speakers)} speaker(s) in the snippet:")
-            
-            # Show transcription with speakers
-            print("\nTranscription with detected speakers:")
-            print("-" * 40)
-            
-            for segment in transcription_segments:
-                start_time = segment.start
-                end_time = segment.end
-                text = segment.text.strip()
-                timestamp = format_timestamp(start_time)
-                
-                # Find speaker for this segment
-                speaker_label = None
-                segment_center = (start_time + end_time) / 2
-                
-                for speaker_segment in speaker_timeline:
-                    if (speaker_segment['start'] <= segment_center <= speaker_segment['end']):
-                        speaker_label = speaker_segment['speaker']
-                        break
-                
-                if speaker_label:
-                    # Convert to readable format
-                    try:
-                        speaker_idx = unique_speakers.index(speaker_label)
-                        readable_speaker = f"Speaker {speaker_idx + 1}"
-                    except ValueError:
-                        readable_speaker = "Unknown Speaker"
-                    
-                    line = f"[{timestamp} {readable_speaker}] {text}"
-                else:
-                    line = f"[{timestamp}] {text}"
-                
-                print(line)
-            
-            if not unique_speakers:
-                print("❌ No speakers detected in snippet.")
-                return []
-            
-            print("\n" + "=" * 50)
-            print("Please identify each speaker:")
-            
-            speaker_mapping = {}
-            for i, speaker in enumerate(unique_speakers):
-                readable_speaker = f"Speaker {i + 1}"
-                while True:
-                    name = input(f"\nWho is '{readable_speaker}'? Enter name (or 'skip' to leave as-is): ").strip()
-                    if name and name.lower() != 'skip':
-                        speaker_mapping[speaker] = name
-                        break
-                    elif name.lower() == 'skip':
-                        speaker_mapping[speaker] = readable_speaker
-                        break
-                    else:
-                        print("Please enter a name or 'skip'")
-            
-            # Return list of names in order of speaker detection
-            speaker_names = [speaker_mapping[speaker] for speaker in unique_speakers]
-            
-            print(f"\n✅ Speaker mapping confirmed:")
-            for i, (original, mapped) in enumerate(speaker_mapping.items()):
-                readable = f"Speaker {unique_speakers.index(original) + 1}"
-                print(f"   {readable} → {mapped}")
-            
-            return speaker_names
-            
-        except Exception as e:
-            print(f"❌ Speaker diarization failed: {e}")
-            print("Showing basic transcription without speakers:")
-            
-            for segment in transcription_segments:
-                timestamp = format_timestamp(segment.start)
-                print(f"[{timestamp}] {segment.text.strip()}")
-            
-            return []
-        
-    finally:
-        # Clean up temporary file
-        if snippet_path and os.path.exists(snippet_path):
-            os.unlink(snippet_path)
-
 
 def save_transcription_data(segments, audio_path: str, model_size: str = "base"):
     """Save transcription segments to intermediate file"""
@@ -343,7 +201,7 @@ def parse_timestamp(timestamp_str: str) -> float:
         return hours * 3600 + minutes * 60 + seconds
     return 0.0
 
-def apply_speaker_diarization(audio_file: str, transcription_data: dict, speaker_names: list = None, num_speakers: int = None):
+def apply_speaker_diarization(audio_file: str, transcription_data: dict, num_speakers: int = None):
     """Apply speaker diarization to existing transcription data"""
     
     overall_start = time.time()
@@ -399,9 +257,6 @@ def apply_speaker_diarization(audio_file: str, transcription_data: dict, speaker
         if num_speakers:
             diarization_params['num_speakers'] = num_speakers
             print(f"🎯 Constraining to {num_speakers} speakers for faster processing")
-        elif speaker_names:
-            diarization_params['num_speakers'] = len(speaker_names)
-            print(f"🎯 Constraining to {len(speaker_names)} speakers based on provided names")
         
         # Use the optimized audio input - pyannote expects specific format
         if isinstance(waveform, torch.Tensor):
@@ -445,22 +300,12 @@ def apply_speaker_diarization(audio_file: str, transcription_data: dict, speaker
                     break
             
             if speaker_label:
-                # Map speaker ID to name if names provided
-                if speaker_names:
-                    try:
-                        speaker_idx = unique_speakers.index(speaker_label)
-                        if speaker_idx < len(speaker_names):
-                            speaker_name = speaker_names[speaker_idx]
-                        else:
-                            speaker_name = f"Speaker {speaker_idx + 1}"
-                    except ValueError:
-                        speaker_name = "Unknown Speaker"
-                else:
-                    try:
-                        speaker_idx = unique_speakers.index(speaker_label)
-                        speaker_name = f"Speaker {speaker_idx + 1}"
-                    except ValueError:
-                        speaker_name = "Unknown Speaker"
+                # Map speaker ID to generic name (Speaker1, Speaker2, etc.)
+                try:
+                    speaker_idx = unique_speakers.index(speaker_label)
+                    speaker_name = f"Speaker{speaker_idx + 1}"
+                except ValueError:
+                    speaker_name = "UnknownSpeaker"
                 
                 line = f"[{timestamp} {speaker_name}] {text}"
             else:
@@ -496,21 +341,23 @@ def cmd_transcribe(args):
     
     # Extract test snippet if requested
     audio_path = args.audio_file
+    test_snippet_path = None
     if hasattr(args, 'test') and args.test:
         duration = getattr(args, 'duration', 60)
         print(f"📝 Test mode: extracting first {duration} seconds...")
-        audio_path = extract_audio_snippet(args.audio_file, duration=duration)
+        test_snippet_path = extract_audio_snippet(args.audio_file, duration=duration)
+        audio_path = test_snippet_path
     
     try:
         # Use public API - cmd_transcribe is just a CLI wrapper
         num_speakers = getattr(args, 'num_speakers', None)
-        speakers_list = args.speakers.split(',') if hasattr(args, 'speakers') and args.speakers else None
+        prompt = getattr(args, 'prompt', None)
         
         segments_list, info = transcribe_audio(
             audio_path,
             model_size=args.model,
             num_speakers=num_speakers,
-            speaker_names=speakers_list,
+            prompt=prompt,
             silent=False
         )
         
@@ -528,12 +375,16 @@ def cmd_transcribe(args):
         if len(segments_list) > 5:
             print(f"... and {len(segments_list) - 5} more segments")
         
-        return transcription_file, audio_path if hasattr(args, 'test') and args.test else None
+        return transcription_file, test_snippet_path
         
-    finally:
-        # Don't clean up test snippet here - let the test workflow handle it
-        # so diarization can use the same snippet
-        pass
+    except Exception as e:
+        # Clean up test snippet on error
+        if test_snippet_path and os.path.exists(test_snippet_path):
+            try:
+                os.unlink(test_snippet_path)
+            except:
+                pass
+        raise
 
 def cmd_diarize(args):
     """Apply speaker diarization to transcription data"""
@@ -551,16 +402,10 @@ def cmd_diarize(args):
         print(f"❌ Original audio file not found: {audio_file}")
         return
     
-    # Parse speaker names
-    speaker_names = None
-    if args.speakers:
-        speaker_names = [name.strip() for name in args.speakers.split(',')]
-    
     # Apply speaker diarization
     result = apply_speaker_diarization(
         audio_file=audio_file,
         transcription_data=transcription_data,
-        speaker_names=speaker_names,
         num_speakers=args.num_speakers
     )
     
@@ -581,34 +426,11 @@ def cmd_test(args):
     duration = getattr(args, 'duration', 60)
     print(f"🧪 Test Mode: Processing {duration}-second snippet")
     
-    # Set test flag
+    # Set test flag so cmd_transcribe knows to extract snippet
     args.test = True
     
-    if args.identify_speakers:
-        # Interactive speaker identification
-        try:
-            speaker_names = identify_speakers_interactively(args.audio_file, args.model, duration)
-            if speaker_names:
-                print(f"\n✅ Identified speakers: {', '.join(speaker_names)}")
-                
-                # Now run a complete test transcription with the identified speakers
-                print(f"\n🔄 Running full test transcription with identified speakers...")
-                
-                # Set speakers for the test run
-                args.speakers = ','.join(speaker_names)
-                args.num_speakers = len(speaker_names)
-                
-                # Run the full test workflow
-                return run_test_workflow(args, speaker_names)
-            else:
-                print("\n❌ No speakers identified.")
-                return []
-        except Exception as e:
-            print(f"❌ Speaker identification failed: {e}")
-            return []
-    else:
-        # Regular test workflow
-        return run_test_workflow(args, None)
+    # Run the test workflow
+    return run_test_workflow(args, None)
 
 def run_test_workflow(args, speaker_names):
     """Run the complete test workflow and show results"""
@@ -621,7 +443,7 @@ def run_test_workflow(args, speaker_names):
     if not result:
         return
         
-    # Handle new return format from cmd_transcribe
+    # Handle return format from cmd_transcribe
     if isinstance(result, tuple):
         transcription_file, test_snippet_path = result
     else:
@@ -630,7 +452,7 @@ def run_test_workflow(args, speaker_names):
     
     # 2. Apply diarization if requested
     test_output_file = None
-    if args.speakers or args.num_speakers:
+    if args.num_speakers or not getattr(args, 'no_diarize', False):
         print(f"👥 Step 2: Applying speaker diarization...")
         
         args.transcription_file = transcription_file
@@ -668,14 +490,15 @@ def run_test_workflow(args, speaker_names):
     print(f"\n🚀 To process the complete audio file, run:")
     print(f"   poetry run python transcribe.py transcribe '{args.audio_file}'")
     
-    if args.speakers or args.num_speakers:
-        speakers_arg = f" --speakers {args.speakers}" if args.speakers else ""
-        num_speakers_arg = f" --num-speakers {args.num_speakers}" if args.num_speakers else ""
-        print(f"   poetry run python transcribe.py diarize <audio-file>.transcript-segments.txt{speakers_arg}{num_speakers_arg}")
-        
-        if speaker_names:
-            print(f"\n💡 Or use the default command for one-step processing:")
-            print(f"   poetry run python transcribe.py default '{args.audio_file}' --speakers {','.join(speaker_names)} --num-speakers {len(speaker_names)}")
+    if args.num_speakers:
+        num_speakers_arg = f" --num-speakers {args.num_speakers}"
+        print(f"   poetry run python transcribe.py diarize <audio-file>.transcript-segments.txt{num_speakers_arg}")
+        print(f"\n💡 Or use the default command for one-step processing:")
+        print(f"   poetry run python transcribe.py default '{args.audio_file}' --num-speakers {args.num_speakers}")
+    else:
+        print(f"   poetry run python transcribe.py diarize <audio-file>.transcript-segments.txt")
+        print(f"\n💡 Or use the default command for one-step processing:")
+        print(f"   poetry run python transcribe.py default '{args.audio_file}'")
     
     # Clean up temporary files
     if transcription_file and os.path.exists(transcription_file):
@@ -701,22 +524,18 @@ def cmd_default(args):
     # Step 1: Transcribe
     result = cmd_transcribe(args)
     if isinstance(result, tuple):
-        transcription_file, _ = result  # Ignore snippet path in default mode
+        transcription_file, _ = result  # Ignore snippet path in default mode (shouldn't have one)
     else:
         transcription_file = result
     
     if not transcription_file:
         return
     
-    # Step 2: Diarize
+    # Step 2: Diarize (unless disabled)
     args.transcription_file = transcription_file
     
-    # Set default speaker names if none provided
-    if not args.speakers and not hasattr(args, 'no_diarize'):
-        args.speakers = "Speaker 1,Speaker 2"
-        print("ℹ️  No speakers specified, using default: Speaker 1, Speaker 2")
-    
-    if args.speakers or args.num_speakers:
+    if not getattr(args, 'no_diarize', False):
+        print("🎯 Running speaker diarization with automatic speaker detection...")
         cmd_diarize(args)
 
 def main():
@@ -725,18 +544,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Test with snippet and interactive speaker identification (custom duration)
-  python transcribe.py test audio.m4a --identify-speakers --duration 90
+  # Test workflow with custom duration and speaker constraint
+  python transcribe.py test audio.m4a --duration 90 --num-speakers 2
   
-  # Full workflow with known speakers  
-  python transcribe.py audio.m4a --speakers Cole,Roman
+  # Full workflow with custom prompt
+  python transcribe.py audio.m4a --prompt "This is a business meeting recording" --num-speakers 3
   
   # Step-by-step workflow
-  python transcribe.py transcribe audio.m4a
-  python transcribe.py diarize audio.transcript-segments.txt --speakers Cole,Roman --num-speakers 2
-  
-  # Test specific parameters with custom duration
-  python transcribe.py test audio.m4a --speakers Cole,Roman --num-speakers 2 --duration 30
+  python transcribe.py transcribe audio.m4a --prompt "This is an interview"
+  python transcribe.py diarize audio.transcript-segments.txt --num-speakers 2
         """
     )
     
@@ -750,32 +566,30 @@ Examples:
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     # Test command
-    test_parser = subparsers.add_parser('test', help='Test on audio snippet (configurable duration)')
+    test_parser = subparsers.add_parser('test', help='Test transcription and diarization on audio snippet')
     test_parser.add_argument('audio_file', help='Path to audio file')
     test_parser.add_argument('--duration', type=int, default=60, help='Test clip duration in seconds (default: 60)')
-    test_parser.add_argument('--identify-speakers', action='store_true', help='Interactive speaker identification (slow)')
-    test_parser.add_argument('--speakers', help='Comma-separated speaker names (e.g., Cole,Roman)')
     test_parser.add_argument('--num-speakers', type=int, help='Expected number of speakers')
+    test_parser.add_argument('--prompt', help='Custom prompt for Whisper transcription')
     test_parser.add_argument('--no-diarize', action='store_true', help='Skip speaker diarization (faster)')
-    test_parser.add_argument('--manual-speakers', action='store_true', help='Manual speaker assignment (fast)')
     test_parser.add_argument('-o', '--output', help='Output file path')
     
     # Transcribe command  
     transcribe_parser = subparsers.add_parser('transcribe', help='Transcribe audio to intermediate format')
     transcribe_parser.add_argument('audio_file', help='Path to audio file')
+    transcribe_parser.add_argument('--prompt', help='Custom prompt for Whisper transcription')
     
     # Diarize command
     diarize_parser = subparsers.add_parser('diarize', help='Apply speaker diarization to transcription')
     diarize_parser.add_argument('transcription_file', help='Path to .transcript-segments.txt file (or legacy .transcription.json)')
-    diarize_parser.add_argument('--speakers', help='Comma-separated speaker names (e.g., Cole,Roman)')
     diarize_parser.add_argument('--num-speakers', type=int, help='Expected number of speakers')
     diarize_parser.add_argument('-o', '--output', help='Output file path')
     
     # Default command (no subcommand) - add as separate subparser
     default_parser = subparsers.add_parser('default', help='Full transcribe + diarize workflow (can omit "default")')
     default_parser.add_argument('audio_file', help='Path to audio file')
-    default_parser.add_argument('--speakers', help='Comma-separated speaker names (e.g., Cole,Roman)')
     default_parser.add_argument('--num-speakers', type=int, help='Expected number of speakers')  
+    default_parser.add_argument('--prompt', help='Custom prompt for Whisper transcription')
     default_parser.add_argument('-o', '--output', help='Output file path')
     default_parser.add_argument('--no-diarize', action='store_true', help='Skip diarization (transcribe only)')
     
